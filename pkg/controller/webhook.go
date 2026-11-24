@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
@@ -34,11 +35,17 @@ import (
 	"github.com/fluxcd/flagger/pkg/canary"
 )
 
+// newHTTPClient builds the HTTP client used for webhook calls. When disableTls
+// is set a fresh transport replaces the default one, so the default proxy and
+// connection pooling settings no longer apply.
 func newHTTPClient(retries int, timeout time.Duration, disableTls bool) *retryablehttp.Client {
 	httpClient := retryablehttp.NewClient()
 	httpClient.RetryMax = retries
 	httpClient.Logger = nil
 	httpClient.HTTPClient.Timeout = timeout
+	// Keep the last response when the retries are exhausted so the status code
+	// and body can still be reported instead of a generic "giving up" error.
+	httpClient.ErrorHandler = retryablehttp.PassthroughErrorHandler
 
 	if disableTls {
 		httpClient.HTTPClient.Transport = &http.Transport{
@@ -49,7 +56,36 @@ func newHTTPClient(retries int, timeout time.Duration, disableTls bool) *retryab
 	return httpClient
 }
 
-func callWebhook(webhook string, payload interface{}, timeout string, retries int, disableTls bool) error {
+// webhookStatusError is returned when the webhook answered with a status code
+// outside the accepted 2xx range. It lets callers distinguish an explicit
+// rejection from a transport failure such as a timeout or an unreachable host.
+type webhookStatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *webhookStatusError) Error() string {
+	statusText := http.StatusText(e.StatusCode)
+	if e.Body != "" {
+		if statusText != "" {
+			return fmt.Sprintf("request failed with status code %d (%s): %s", e.StatusCode, statusText, e.Body)
+		}
+		return fmt.Sprintf("request failed with status code %d: %s", e.StatusCode, e.Body)
+	}
+	if statusText != "" {
+		return fmt.Sprintf("request failed with status code %d (%s)", e.StatusCode, statusText)
+	}
+	return fmt.Sprintf("request failed with status code %d", e.StatusCode)
+}
+
+// isWebhookStatusError reports whether the webhook reached the server and was
+// rejected, as opposed to failing at the transport level.
+func isWebhookStatusError(err error) bool {
+	var statusErr *webhookStatusError
+	return errors.As(err, &statusErr)
+}
+
+func callWebhook(webhook string, payload interface{}, timeout time.Duration, retries int, disableTls bool) error {
 	payloadBin, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -60,15 +96,7 @@ func callWebhook(webhook string, payload interface{}, timeout string, retries in
 		return err
 	}
 
-	if timeout == "" {
-		timeout = "10s"
-	}
-	t, err := time.ParseDuration(timeout)
-	if err != nil {
-		return err
-	}
-
-	httpClient := newHTTPClient(retries, t, disableTls)
+	httpClient := newHTTPClient(retries, timeout, disableTls)
 
 	req, err := retryablehttp.NewRequest("POST", hook.String(), bytes.NewBuffer(payloadBin))
 	if err != nil {
@@ -87,15 +115,17 @@ func callWebhook(webhook string, payload interface{}, timeout string, retries in
 		return fmt.Errorf("error reading body: %s", err.Error())
 	}
 
-	if r.StatusCode > 202 {
-		return errors.New(string(b))
+	// Any 2xx response is a pass. Servers commonly answer with 204 No Content
+	// for an accepted gate check.
+	if r.StatusCode < 200 || r.StatusCode > 299 {
+		return &webhookStatusError{StatusCode: r.StatusCode, Body: strings.TrimSpace(string(b))}
 	}
 
 	return nil
 }
 
-// CallWebhook does a HTTP POST to an external service and
-// returns an error if the response status code is non-2xx
+// CallWebhook does an HTTP POST to an external service and returns an error if
+// the response status code is outside the 2xx range or the request fails.
 func CallWebhook(canary flaggerv1.Canary, phase flaggerv1.CanaryPhase, w flaggerv1.CanaryWebhook) error {
 	payload := flaggerv1.CanaryWebhookPayload{
 		Name:      canary.Name,
@@ -108,11 +138,12 @@ func CallWebhook(canary flaggerv1.Canary, phase flaggerv1.CanaryPhase, w flagger
 		payload.Metadata = *w.Metadata
 	}
 
-	if len(w.Timeout) < 2 {
-		w.Timeout = "10s"
+	timeout, err := webhookTimeout(w)
+	if err != nil {
+		return err
 	}
 
-	return callWebhook(w.URL, payload, w.Timeout, w.Retries, w.DisableTLS)
+	return callWebhook(w.URL, payload, timeout, w.Retries, w.DisableTLS)
 }
 
 func CallEventWebhook(r *flaggerv1.Canary, w flaggerv1.CanaryWebhook, message, eventtype string) error {
@@ -138,7 +169,13 @@ func CallEventWebhook(r *flaggerv1.Canary, w flaggerv1.CanaryWebhook, message, e
 			payload.Metadata[key] = value
 		}
 	}
-	return callWebhook(w.URL, payload, w.Timeout, w.Retries, w.DisableTLS)
+
+	timeout, err := webhookTimeout(w)
+	if err != nil {
+		return err
+	}
+
+	return callWebhook(w.URL, payload, timeout, w.Retries, w.DisableTLS)
 }
 
 func canaryChecksum(c flaggerv1.Canary) string {

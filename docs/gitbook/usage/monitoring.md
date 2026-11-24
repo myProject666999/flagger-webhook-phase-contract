@@ -127,4 +127,7 @@ flagger_canary_successes_total{name="podinfo",namespace="test",deployment_strate
 
 # Canary failures total counter
 flagger_canary_failures_total{name="podinfo",namespace="test",deployment_strategy="canary",analysis_status="completed"} 1
+
+# Failed webhook invocations that do not block the canary (post-rollout hooks)
+flagger_canary_webhook_failures_total{name="podinfo",namespace="test",hook_type="post-rollout"} 2
 ```

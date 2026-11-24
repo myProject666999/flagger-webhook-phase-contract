@@ -24,7 +24,7 @@ There are several types of hooks:
   While the promotion is paused, Flagger will continue to run the metrics checks and rollout hooks.
 
 * **post-rollout** hooks are executed after the canary has been promoted or rolled back.
-  If a post rollout hook fails the error is logged.
+  A post-rollout failure is recorded as an event and does not block the rollout; see the contract below.
 
 * **rollback** hooks are executed while a canary deployment is in either Progressing or Waiting status.
   This provides the ability to rollback during analysis or while waiting for a confirmation. If a rollback hook
@@ -32,6 +32,90 @@ There are several types of hooks:
 
 * **event** hooks are executed every time Flagger emits a Kubernetes event. When configured,
   every action that Flagger takes during a canary deployment will be sent as JSON via an HTTP POST request.
+
+## Webhook contract
+
+The table below is the complete contract for every hook type: when it runs, how
+several hooks of the same type are handled, what a failure does, and which phase
+the payload carries.
+
+* **Failure blocks** means the failure stops the current analysis cycle; the next
+  cycle retries the hook.
+* **Failure counts towards failed checks** means `status.failedChecks` is
+  incremented, which eventually reaches the failure threshold and triggers a
+  rollback.
+* **short-circuit** stops at the first failing hook, so the following hooks of
+  the same type are not called. **run-all** calls every hook even if one fails.
+  **first-action** stops at the first hook that answers with a 2xx status.
+* `muteAlert` only has an effect on the hook types whose contract sends an alert.
+
+<!-- BEGIN WEBHOOK CONTRACT -->
+| Type | When | Multiple hooks of the same type | Failure blocks | Failure counts towards failed checks | Failure changes phase | Failure alerts | Payload phase |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `confirm-rollout` | Once per cycle after a target change is detected, before the canary is scaled up; retried every cycle until approved | short-circuit | yes | no | Waiting (first failure only) | yes (`muteAlert` mutes it) | current status phase |
+| `pre-rollout` | Once at the start of an analysis, before traffic is routed to the canary (weight 0, no iterations) | short-circuit | yes | yes | no | no | Progressing |
+| `rollout` | Once per analysis cycle before the metric checks; a webhook with an empty type is treated as rollout | short-circuit | yes | yes | no | no | Progressing |
+| `confirm-traffic-increase` | Before each canary weight increase, except in Promoting, WaitingPromotion and Finalising and when traffic is mirrored | short-circuit | yes | no | no | yes (`muteAlert` mutes it) | Progressing |
+| `confirm-promotion` | At the promotion gate, when the canary weight or iteration count reaches the maximum, before the spec is copied to the primary | short-circuit | yes | no | WaitingPromotion (first failure only) | yes (`muteAlert` mutes it) | Progressing |
+| `post-rollout` | Once when the analysis finishes: on success, on skipped analysis, on rollback and when promotion fails | run-all | no | no | no | no | Succeeded on success or skipped analysis, Failed on rollback or failed promotion |
+| `rollback` | Once per cycle while the canary is Progressing, Waiting or WaitingPromotion; a 2xx response requests a rollback | first-action | no | no | no | no | current status phase |
+| `event` | On every Kubernetes event Flagger emits, including events produced by the other hooks | run-all | no | no | no | no | current status phase |
+<!-- END WEBHOOK CONTRACT -->
+
+A webhook type that is not listed above is rejected when the Canary is
+validated, so a mistyped gate type cannot be silently ignored. An empty type is
+the documented alias for `rollout`.
+
+### Failure handling details
+
+* **post-rollout** hooks never block the rollout. Every post-rollout hook is
+  called, each failure is recorded as a warning event and counted in the
+  `flagger_canary_webhook_failures_total` metric (labelled with the hook type),
+  and the Canary status is left unchanged.
+* **rollback** hooks are inverted: a 2xx response requests a rollback, an
+  explicit non-2xx response means "do not roll back". A hook that cannot be
+  reached (connection refused, timeout) is also treated as "do not roll back",
+  but a warning event is emitted so a broken rollback switch does not stay
+  silent.
+* The **confirm-rollout** and **confirm-promotion** gates emit their event and
+  alert only when they first put the Canary into `Waiting` or
+  `WaitingPromotion`; while the gate stays closed the hook is retried without
+  repeating the alert.
+* A **confirm-promotion** failure while the Canary already waits at that gate
+  rewinds the iteration counter so the promotion does not advance.
+
+### Request semantics
+
+* A response is accepted when its status code is in the `2xx` range, including
+  `204 No Content`. Any other status code, a timeout or a connection error is a
+  failure.
+* When the response body is empty, the error text falls back to the status code
+  description, so the event and alert messages are never just a prefix.
+* The default request timeout is `defaultWebhookTimeout` in
+  `pkg/controller/webhook_contract.go`; it is applied in one place for both
+  analysis hooks and event hooks. An invalid timeout is rejected when the Canary
+  is validated instead of on the first hook call.
+* `retries` is passed to the retrying HTTP client. Each attempt is limited by the
+  hook timeout, so a single hook can occupy the analysis cycle for roughly
+  `(retries + 1) * timeout` plus retry backoff. Flagger does not enforce a
+  per-cycle deadline: the timeouts of all hooks executed in a cycle add up and
+  should stay below the analysis interval.
+* `disableTLS` replaces the HTTP transport with a new one that skips TLS
+  verification, so the default proxy and connection settings are not used.
+
+### Checksum
+
+The `checksum` field is the hash of `status.trackedConfigs` and
+`status.lastAppliedSpec`. It changes when a new target revision is applied and
+the canary starts progressing again, and every hook of that analysis receives
+the same value (the post-rollout hook on rollback and on success receives the
+release that was analysed).
+
+While a `confirm-rollout` gate holds a new revision in `Waiting`, the status
+still describes the previously promoted release, so the checksum does not
+change until the gate is approved and the analysis starts. A receiver that must
+identify the pending revision should not rely on the checksum during that
+window.
 
 Spec:
 
@@ -79,7 +163,7 @@ Spec:
           cluster: "flagger-test"
 ```
 
-> **Note** that the sum of all rollout webhooks timeouts should be lower than the analysis interval.
+> **Note** that the sum of all rollout webhooks timeouts (each multiplied by its retries) should be lower than the analysis interval.
 
 Webhook payload (HTTP POST):
 
@@ -100,10 +184,11 @@ The checksum field is hashed from the TrackedConfigs and LastAppliedSpec of the 
 
 Response status codes:
 
-* 200-202 - advance canary by increasing the traffic weight
-* timeout or non-2xx - halt advancement and increment failed checks
+* any 2xx (including 204 No Content) - the hook passed
+* timeout, connection error or any non-2xx - the hook failed
 
 On a non-2xx response Flagger will include the response body (if any) in the failed checks log and Kubernetes events.
+When the body is empty, the status code is reported instead.
 
 Event payload (HTTP POST):
 

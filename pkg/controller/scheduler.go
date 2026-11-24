@@ -451,17 +451,11 @@ func (c *Controller) advanceCanary(name string, namespace string) {
 		c.recordEventInfof(cd, "Starting canary analysis for %s.%s", cd.Spec.TargetRef.Name, cd.Namespace)
 
 		// run pre-rollout web hooks
-		if ok := c.runPreRolloutHooks(cd); !ok {
-			if err := canaryController.SetStatusFailedChecks(cd, cd.Status.FailedChecks+1); err != nil {
-				c.recordEventWarningf(cd, "%v", err)
-			}
+		if ok := c.runPreRolloutHooks(cd, canaryController); !ok {
 			return
 		}
 	} else {
-		if ok := c.runAnalysis(cd); !ok {
-			if err := canaryController.SetStatusFailedChecks(cd, cd.Status.FailedChecks+1); err != nil {
-				c.recordEventWarningf(cd, "%v", err)
-			}
+		if ok := c.runAnalysis(cd, canaryController); !ok {
 			return
 		}
 	}
@@ -749,26 +743,22 @@ func (c *Controller) runBlueGreen(canary *flaggerv1.Canary, canaryController can
 
 }
 
-func (c *Controller) runAnalysis(canary *flaggerv1.Canary) bool {
-	// run external checks
-	for _, webhook := range canary.GetAnalysis().Webhooks {
-		if webhook.Type == "" || webhook.Type == flaggerv1.RolloutHook {
-			err := CallWebhook(*canary, flaggerv1.CanaryPhaseProgressing, webhook)
-			if err != nil {
-				c.recordEventWarningf(canary, "Halt %s.%s advancement external check %s failed %v",
-					canary.Name, canary.Namespace, webhook.Name, err)
-				return false
-			}
-		}
+func (c *Controller) runAnalysis(canary *flaggerv1.Canary, canaryController canary.Controller) bool {
+	// run external checks, i.e. the rollout webhooks; the empty type is an
+	// alias for rollout
+	if ok := c.runRolloutHooks(canary, canaryController); !ok {
+		return false
 	}
 
 	ok := c.runBuiltinMetricChecks(canary)
 	if !ok {
+		c.bumpFailedChecks(canary, canaryController)
 		return ok
 	}
 
 	ok = c.runMetricChecks(canary)
 	if !ok {
+		c.bumpFailedChecks(canary, canaryController)
 		return ok
 	}
 

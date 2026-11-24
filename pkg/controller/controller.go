@@ -340,6 +340,9 @@ func (c *Controller) verifyCanary(canary *flaggerv1.Canary) error {
 	if err := verifySessionAffinity(canary); err != nil {
 		return err
 	}
+	if err := validateWebhookConfig(canary); err != nil {
+		return err
+	}
 
 	return nil
 }

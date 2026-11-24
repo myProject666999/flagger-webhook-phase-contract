@@ -45,6 +45,18 @@ type CanaryMetricLabels struct {
 	AnalysisStatus     string
 }
 
+// WebhookMetricLabels holds labels for webhook metrics
+type WebhookMetricLabels struct {
+	Name      string
+	Namespace string
+	HookType  string
+}
+
+// Values returns label values as a slice for Prometheus metrics
+func (c WebhookMetricLabels) Values() []string {
+	return []string{c.Name, c.Namespace, c.HookType}
+}
+
 // Values returns label values as a slice for Prometheus metrics
 func (c CanaryMetricLabels) Values() []string {
 	return []string{c.Name, c.Namespace, c.DeploymentStrategy, c.AnalysisStatus}
@@ -60,6 +72,9 @@ type Recorder struct {
 	analysis  *prometheus.GaugeVec
 	successes *prometheus.CounterVec
 	failures  *prometheus.CounterVec
+	// webhookFailures counts failed webhook invocations whose contract does not
+	// treat the failure as blocking (post-rollout).
+	webhookFailures *prometheus.CounterVec
 }
 
 // NewRecorder creates a new recorder and registers the Prometheus metrics
@@ -114,6 +129,12 @@ func NewRecorder(controller string, register bool) Recorder {
 		Help:      "Total number of canary failures",
 	}, []string{"name", "namespace", "deployment_strategy", "analysis_status"})
 
+	webhookFailures := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: controller,
+		Name:      "canary_webhook_failures_total",
+		Help:      "Total number of failed webhook invocations that do not block the canary",
+	}, []string{"name", "namespace", "hook_type"})
+
 	if register {
 		prometheus.MustRegister(info)
 		prometheus.MustRegister(duration)
@@ -123,17 +144,19 @@ func NewRecorder(controller string, register bool) Recorder {
 		prometheus.MustRegister(analysis)
 		prometheus.MustRegister(successes)
 		prometheus.MustRegister(failures)
+		prometheus.MustRegister(webhookFailures)
 	}
 
 	return Recorder{
-		info:      info,
-		duration:  duration,
-		total:     total,
-		status:    status,
-		weight:    weight,
-		analysis:  analysis,
-		successes: successes,
-		failures:  failures,
+		info:            info,
+		duration:        duration,
+		total:           total,
+		status:          status,
+		weight:          weight,
+		analysis:        analysis,
+		successes:       successes,
+		failures:        failures,
+		webhookFailures: webhookFailures,
 	}
 }
 
@@ -184,6 +207,17 @@ func (cr *Recorder) IncSuccesses(labels CanaryMetricLabels) {
 // IncFailures increments the total number of canary failures
 func (cr *Recorder) IncFailures(labels CanaryMetricLabels) {
 	cr.failures.WithLabelValues(labels.Values()...).Inc()
+}
+
+// IncWebhookFailures increments the number of failed webhook invocations that
+// do not block the canary analysis
+func (cr *Recorder) IncWebhookFailures(labels WebhookMetricLabels) {
+	cr.webhookFailures.WithLabelValues(labels.Values()...).Inc()
+}
+
+// GetWebhookFailuresMetric returns the webhook failures metric
+func (cr *Recorder) GetWebhookFailuresMetric() *prometheus.CounterVec {
+	return cr.webhookFailures
 }
 
 // GetStatusMetric returns the status metric
